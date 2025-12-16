@@ -1,4 +1,4 @@
-dicompyler-core
+dicompyler-core | This fork aims to port dicompyler-core to Python 3.11 and later (tested on Python 3.11.9).
 ===============
 
 |Binder| |pypi| |Python Version| |GH Actions| |Documentation Status| |coveralls| |Codacy| |Codecov| |Total Lines| |Code Size| |Zenodo|
