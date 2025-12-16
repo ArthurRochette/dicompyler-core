@@ -19,6 +19,8 @@ try:
 except ImportError:
     from collections import Sequence
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 logger = logging.getLogger('dicompylercore.dvhcalc')
 
 if skimage_available:
@@ -35,7 +37,8 @@ def get_dvh(structure,
             interpolation_segments_between_planes=0,
             thickness=None,
             memmap_rtdose=False,
-            callback=None):
+            callback=None,
+            num_workers=1):
     """Calculate a cumulative DVH in Gy from a DICOM RT Structure Set & Dose.
 
     Parameters
@@ -66,6 +69,11 @@ def get_dvh(structure,
         This reduces memory usage at the expense of increased calculation time.
     callback : function, optional
         A function that will be called at every iteration of the calculation.
+    num_workers : int, optional
+        Number of parallel workers to use for processing z-planes. Default is 1
+        (sequential processing). Set to None to use all available CPU cores.
+        Using multiple workers can significantly speed up DVH calculation for
+        structures with many z-planes.
 
     Returns
     -------
@@ -86,7 +94,7 @@ def get_dvh(structure,
     calcdvh = _calculate_dvh(s, rtdose, limit, calculate_full_volume,
                              use_structure_extents, interpolation_resolution,
                              interpolation_segments_between_planes,
-                             callback)
+                             callback, num_workers)
     return dvh.DVH(counts=calcdvh.histogram,
                    bins=(np.arange(0, 2) if (calcdvh.histogram.size == 1) else
                          np.arange(0, calcdvh.histogram.size + 1) / 100),
@@ -103,7 +111,8 @@ def _calculate_dvh(structure,
                    use_structure_extents=False,
                    interpolation_resolution=None,
                    interpolation_segments_between_planes=0,
-                   callback=None):
+                   callback=None,
+                   num_workers=1):
     """Calculate a differential DVH for the given structure and dose grid.
 
     Parameters
@@ -127,6 +136,9 @@ def _calculate_dvh(structure,
         Number of segments to interpolate between structure slices.
     callback : function, optional
         A function that will be called at every iteration of the calculation.
+    num_workers : int, optional
+        Number of parallel workers to use for processing z-planes. Default is 1
+        (sequential processing). Set to None to use all available CPU cores.
 
     Returns
     -------
@@ -204,51 +216,92 @@ def _calculate_dvh(structure,
         structure['thickness'] = structure[
             'thickness'] / (interpolation_segments_between_planes + 1)
 
+    origin_z = id['position'][2]
+
     # Iterate over each plane in the structure
-    for z, plane in planes.items():
-        # Get the dose plane for the current structure plane
-        if interpolation_resolution or use_structure_extents:
-            doseplane = get_interpolated_dose(
-                dose, z, interpolation_resolution, dgindexextents)
-        else:
-            doseplane = dose.GetDoseGrid(z)
-        if doseplane.size:
-            planedata[z] = calculate_plane_histogram(plane, doseplane,
-                                                     dosegridpoints, maxdose,
-                                                     dd, id, structure, hist)
-            # print(f'Slice: {z}, volume: {planedata[z][1]}')
-        else:
-            # If the dose plane is not found, still perform the calculation
-            # but only use it to calculate the volume for the slice
-            if not calculate_full_volume:
-                logger.warning('Dose plane not found for %s. Contours' +
-                               ' not used for volume calculation.', z)
-                notes = 'Dose grid does not encompass every contour.' + \
-                    ' Volume calculated within dose grid.'
+    if num_workers == 1:
+        # Sequential processing (original behavior)
+        for z, plane in planes.items():
+            # Get the dose plane for the current structure plane
+            if interpolation_resolution or use_structure_extents:
+                doseplane = get_interpolated_dose(
+                    dose, z, interpolation_resolution, dgindexextents)
             else:
-                origin_z = id['position'][2]
-                logger.warning('Dose plane not found for %s.' +
-                               ' Using %s to calculate contour volume.',
-                               z, origin_z)
-                # Create a dummy dose grid with the correct size.
-                # calculate_plane_histogram() and its methods provide the
-                # volume calc needed, but do so as part of DVH calc,
-                # which requires a dose grid
-                dummy_dose = dose.GetDoseGrid(origin_z)
-                if use_structure_extents:
-                    extents = dgindexextents
-                    dummy_dose = dummy_dose[
-                        extents[1]:extents[3], extents[0]:extents[2]
-                    ]
-                _, vol = calculate_plane_histogram(
-                    plane, dummy_dose, dosegridpoints, maxdose,
-                    dd, id, structure, hist)
-                planedata[z] = (np.array([0]), vol)
-                notes = 'Dose grid does not encompass every contour.' + \
-                    ' Volume calculated for all contours.'
-        n += 1
-        if callback:
-            callback(n, len(planes))
+                doseplane = dose.GetDoseGrid(z)
+            if doseplane.size:
+                planedata[z] = calculate_plane_histogram(plane, doseplane,
+                                                         dosegridpoints, maxdose,
+                                                         dd, id, structure, hist)
+                # print(f'Slice: {z}, volume: {planedata[z][1]}')
+            else:
+                # If the dose plane is not found, still perform the calculation
+                # but only use it to calculate the volume for the slice
+                if not calculate_full_volume:
+                    logger.warning('Dose plane not found for %s. Contours' +
+                                   ' not used for volume calculation.', z)
+                    notes = 'Dose grid does not encompass every contour.' + \
+                        ' Volume calculated within dose grid.'
+                else:
+                    logger.warning('Dose plane not found for %s.' +
+                                   ' Using %s to calculate contour volume.',
+                                   z, origin_z)
+                    # Create a dummy dose grid with the correct size.
+                    # calculate_plane_histogram() and its methods provide the
+                    # volume calc needed, but do so as part of DVH calc,
+                    # which requires a dose grid
+                    dummy_dose = dose.GetDoseGrid(origin_z)
+                    if use_structure_extents:
+                        extents = dgindexextents
+                        dummy_dose = dummy_dose[
+                            extents[1]:extents[3], extents[0]:extents[2]
+                        ]
+                    _, vol = calculate_plane_histogram(
+                        plane, dummy_dose, dosegridpoints, maxdose,
+                        dd, id, structure, hist)
+                    planedata[z] = (np.array([0]), vol)
+                    notes = 'Dose grid does not encompass every contour.' + \
+                        ' Volume calculated for all contours.'
+            n += 1
+            if callback:
+                callback(n, len(planes))
+    else:
+        # Parallel processing
+        logger.debug("Processing %d planes with %d workers", len(planes),
+                    num_workers if num_workers else 'all available')
+
+        # Create partial function with fixed parameters
+        process_func = partial(
+            _process_single_plane,
+            dose=dose,
+            interpolation_resolution=interpolation_resolution,
+            use_structure_extents=use_structure_extents,
+            dgindexextents=dgindexextents,
+            dosegridpoints=dosegridpoints,
+            maxdose=maxdose,
+            dd=dd,
+            id=id,
+            structure=structure,
+            calculate_full_volume=calculate_full_volume,
+            origin_z=origin_z
+        )
+
+        # Process planes in parallel
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_z = {
+                executor.submit(process_func, z, plane): z
+                for z, plane in planes.items()
+            }
+
+            # Collect results as they complete
+            for future in as_completed(future_to_z):
+                z, hist_result, vol, plane_notes = future.result()
+                planedata[z] = (hist_result, vol)
+                if plane_notes:
+                    notes = plane_notes
+                n += 1
+                if callback:
+                    callback(n, len(planes))
     # Volume units are given in cm^3
     volume = sum([p[1] for p in planedata.values()]) / 1000
     # print(f'total volume: {volume}')
@@ -262,6 +315,91 @@ def _calculate_dvh(structure,
     hist = np.trim_zeros(hist, trim='b')
 
     return calcdvh(notes, hist)
+
+
+def _process_single_plane(z, plane, dose, interpolation_resolution,
+                         use_structure_extents, dgindexextents, dosegridpoints,
+                         maxdose, dd, id, structure, calculate_full_volume,
+                         origin_z):
+    """Process a single plane for DVH calculation.
+
+    This is a helper function designed to be called in parallel.
+
+    Parameters
+    ----------
+    z : float
+        The z-coordinate of the plane.
+    plane : list
+        The contour data for this plane.
+    dose : DicomParser
+        A DicomParser instance of an RT Dose.
+    interpolation_resolution : tuple or float or None
+        Resolution for interpolation.
+    use_structure_extents : bool
+        Whether to use structure extents.
+    dgindexextents : list or None
+        Dose grid index extents.
+    dosegridpoints : ndarray
+        Dose grid points for mask calculation.
+    maxdose : int
+        Maximum dose value.
+    dd : dict
+        Dose data dictionary.
+    id : dict
+        Image data dictionary.
+    structure : dict
+        Structure dictionary.
+    calculate_full_volume : bool
+        Whether to calculate full volume.
+    origin_z : float
+        Origin z coordinate for dummy dose grid.
+
+    Returns
+    -------
+    tuple
+        (z, histogram, volume, notes) for this plane.
+    """
+    notes = None
+
+    # Get the dose plane for the current structure plane
+    if interpolation_resolution or use_structure_extents:
+        doseplane = get_interpolated_dose(
+            dose, z, interpolation_resolution, dgindexextents)
+    else:
+        doseplane = dose.GetDoseGrid(z)
+
+    if doseplane.size:
+        hist, vol = calculate_plane_histogram(plane, doseplane,
+                                              dosegridpoints, maxdose,
+                                              dd, id, structure, None)
+    else:
+        # If the dose plane is not found, still perform the calculation
+        # but only use it to calculate the volume for the slice
+        if not calculate_full_volume:
+            logger.warning('Dose plane not found for %s. Contours' +
+                          ' not used for volume calculation.', z)
+            notes = 'Dose grid does not encompass every contour.' + \
+                ' Volume calculated within dose grid.'
+            hist, vol = np.array([0]), 0
+        else:
+            logger.warning('Dose plane not found for %s.' +
+                          ' Using %s to calculate contour volume.',
+                          z, origin_z)
+            # Create a dummy dose grid with the correct size.
+            dummy_dose = dose.GetDoseGrid(origin_z)
+            if use_structure_extents and dgindexextents is not None:
+                extents = dgindexextents
+                dummy_dose = dummy_dose[
+                    extents[1]:extents[3], extents[0]:extents[2]
+                ]
+            _, vol = calculate_plane_histogram(
+                plane, dummy_dose, dosegridpoints, maxdose,
+                dd, id, structure, None)
+            hist = np.array([0])
+            notes = 'Dose grid does not encompass every contour.' + \
+                ' Volume calculated for all contours.'
+
+    return (z, hist, vol, notes)
 
 
 def calculate_plane_histogram(plane, doseplane, dosegridpoints, maxdose, dd,

@@ -13,7 +13,7 @@ shapely_available = True
 skimage_available = True
 scipy_available = True
 
-import importlib
+import importlib.util
 
 mpl_available = importlib.util.find_spec("matplotlib") is not None
 pil_available = importlib.util.find_spec("PIL") is not None
